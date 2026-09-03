@@ -1,6 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
 import { MetricsService } from '../observability/metrics/metrics.service';
+import { ConfigService } from '@nestjs/config';
 import { Inject } from '@nestjs/common';
 import {
   OnchainAdapter,
@@ -15,6 +17,11 @@ import {
   RetryableErrorType,
   SorobanTransaction,
 } from '@prisma/client';
+import {
+  StuckTransactionInfo,
+  StuckTransactionMetrics,
+  StuckDetectionConfig,
+} from './stuck-transaction.types';
 
 export interface CreateSorobanTransactionParams {
   claimId?: string;
@@ -47,12 +54,22 @@ export class SorobanTransactionLifecycleService {
   // Transaction expiry time
   private readonly TRANSACTION_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours
 
+  // Stuck transaction detection threshold (configurable)
+  private readonly STUCK_TRANSACTION_THRESHOLD_MS: number;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly metricsService: MetricsService,
+    private readonly configService: ConfigService,
     @Inject(ONCHAIN_ADAPTER_TOKEN)
     private readonly onchainAdapter: OnchainAdapter,
-  ) {}
+  ) {
+    this.STUCK_TRANSACTION_THRESHOLD_MS = parseInt(
+      this.configService.get<string>('STUCK_TRANSACTION_THRESHOLD_MS') ||
+        '300000',
+      10,
+    ); // 5 minutes default
+  }
 
   /**
    * Create a new Soroban transaction record with lifecycle tracking
@@ -457,6 +474,82 @@ export class SorobanTransactionLifecycleService {
   }
 
   /**
+   * Detect transactions stuck in a non-terminal state past the configured threshold.
+   * A transaction is considered stuck if it is in `pending` or `submitted` status
+   * and has not progressed within the allowed ledger window.
+   */
+  async detectStuckTransactions() {
+    const stuckThreshold = new Date(
+      Date.now() - this.STUCK_TRANSACTION_THRESHOLD_MS,
+    );
+
+    const stuckTransactions = await this.prisma.sorobanTransaction.findMany({
+      where: {
+        status: {
+          in: [
+            SorobanTransactionStatus.pending,
+            SorobanTransactionStatus.submitted,
+          ],
+        },
+        updatedAt: {
+          lt: stuckThreshold,
+        },
+      },
+      orderBy: {
+        updatedAt: 'asc',
+      },
+    });
+
+    const stuckCount = stuckTransactions.length;
+
+    if (stuckCount > 0) {
+      this.logger.warn(`Detected ${stuckCount} stuck Soroban transactions`, {
+        thresholdMs: this.STUCK_TRANSACTION_THRESHOLD_MS,
+        operations: stuckTransactions.map(t => t.operation),
+      });
+
+      this.metricsService.setGauge(
+        'soroban_transaction_stuck_total',
+        stuckCount,
+      );
+
+      const countsByOperation = stuckTransactions.reduce<
+        Record<string, number>
+      >((acc, tx) => {
+        acc[tx.operation] = (acc[tx.operation] || 0) + 1;
+        return acc;
+      }, {});
+
+      for (const [operation, count] of Object.entries(countsByOperation)) {
+        this.metricsService.setGauge(
+          'soroban_transaction_stuck_by_operation',
+          count,
+          {
+            operation,
+          },
+        );
+      }
+    }
+
+    return {
+      stuckCount,
+      thresholdMs: this.STUCK_TRANSACTION_THRESHOLD_MS,
+      transactions: stuckTransactions.map(tx => ({
+        id: tx.id,
+        operation: tx.operation,
+        status: tx.status,
+        errorType: tx.errorType,
+        lastError: tx.lastError,
+        isRetryable: tx.isRetryable,
+        updatedAt: tx.updatedAt,
+        createdAt: tx.createdAt,
+        claimId: tx.claimId,
+        correlationId: tx.correlationId,
+      })),
+    };
+  }
+
+  /**
    * Get transaction status and details
    */
   async getTransactionStatus(transactionId: string) {
@@ -527,5 +620,125 @@ export class SorobanTransactionLifecycleService {
 
     // Execute the retry immediately
     await this.executeTransaction(transactionId);
+  }
+
+  // ── Stuck transaction detection ──────────────────────────────────
+
+  /** Override stuck-detection thresholds at runtime. */
+  configureStuckDetection(partial: Partial<StuckDetectionConfig>): void {
+    this.stuckDetectionConfig = { ...this.stuckDetectionConfig, ...partial };
+    this.logger.log(
+      `Stuck detection config updated: maxAgeMs=${this.stuckDetectionConfig.maxAgeMs}`,
+    );
+  }
+
+  getStuckDetectionConfig(): Readonly<StuckDetectionConfig> {
+    return { ...this.stuckDetectionConfig };
+  }
+
+  /**
+   * Core stuck-detection scan. Finds all transactions in a non-terminal
+   * state whose age exceeds `maxAgeMs` and updates in-memory metrics.
+   */
+  @Cron('*/30 * * * * *', {
+    name: 'stuck-transaction-scan',
+  })
+  async detectStuckTransactions(): Promise<StuckTransactionInfo[]> {
+    const maxAge = this.stuckDetectionConfig.maxAgeMs;
+    const cutoff = new Date(Date.now() - maxAge);
+
+    this.logger.debug(
+      `Running stuck-detection scan (maxAgeMs=${maxAge}, cutoff=${cutoff.toISOString()})`,
+    );
+
+    // Fetch all transactions in non-terminal states
+    const nonTerminalTxs = await this.prisma.sorobanTransaction.findMany({
+      where: {
+        status: {
+          in: [
+            SorobanTransactionStatus.pending,
+            SorobanTransactionStatus.submitted,
+          ],
+        },
+        createdAt: {
+          lt: cutoff,
+        },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const stuckTransactions: StuckTransactionInfo[] = [];
+
+    // Reset metrics
+    this.lastStuckCountByOperation = new Map();
+    this.lastStuckCountByError = new Map();
+    this.lastTotalStuck = 0;
+    this.lastOldestStuckAgeMs = null;
+
+    for (const tx of nonTerminalTxs) {
+      const ageInMs = Date.now() - tx.createdAt.getTime();
+
+      const info: StuckTransactionInfo = {
+        id: tx.id,
+        claimId: tx.claimId,
+        operationType: tx.operation,
+        status: tx.status,
+        txHash: tx.txHash,
+        attemptCount: tx.attemptCount,
+        maxAttempts: tx.maxAttempts,
+        isRetryable: tx.isRetryable,
+        errorType: tx.errorType,
+        lastError: tx.lastError,
+        createdAt: tx.createdAt,
+        updatedAt: tx.updatedAt,
+        ageInMs,
+      };
+
+      stuckTransactions.push(info);
+
+      // Aggregate by operation type
+      const opCount = this.lastStuckCountByOperation.get(tx.operation) ?? 0;
+      this.lastStuckCountByOperation.set(tx.operation, opCount + 1);
+
+      // Aggregate by error type
+      if (tx.errorType) {
+        const errCount = this.lastStuckCountByError.get(tx.errorType) ?? 0;
+        this.lastStuckCountByError.set(tx.errorType, errCount + 1);
+      }
+
+      this.lastTotalStuck++;
+
+      if (
+        this.lastOldestStuckAgeMs === null ||
+        ageInMs > this.lastOldestStuckAgeMs
+      ) {
+        this.lastOldestStuckAgeMs = ageInMs;
+      }
+    }
+
+    this.lastScanAt = new Date();
+
+    this.logger.log(
+      `Stuck-detection scan complete: ${stuckTransactions.length} stuck ` +
+        `out of ${nonTerminalTxs.length} non-terminal`,
+    );
+
+    return stuckTransactions;
+  }
+
+  /** Return stuck transactions from the most recent scan. */
+  async getStuckTransactions(): Promise<StuckTransactionInfo[]> {
+    return this.detectStuckTransactions();
+  }
+
+  /** Return aggregated stuck-count metrics broken down by operation type. */
+  getStuckMetrics(): StuckTransactionMetrics {
+    return {
+      totalStuck: this.lastTotalStuck,
+      byOperationType: Object.fromEntries(this.lastStuckCountByOperation),
+      byErrorType: Object.fromEntries(this.lastStuckCountByError),
+      oldestStuckAgeMs: this.lastOldestStuckAgeMs,
+      generatedAt: this.lastScanAt ?? new Date(),
+    };
   }
 }
